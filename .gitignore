@@ -1,0 +1,5 @@
+.build/
+Paranco.app/
+Resources/Paranco.icns
+*.xcodeproj
+.DS_Store
