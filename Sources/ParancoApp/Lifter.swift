@@ -15,6 +15,7 @@ import ParancoCore
     @Published private(set) var unchanged = 0
     @Published private(set) var skipped = 0
     @Published private(set) var failed = 0
+    @Published private(set) var notHere = 0
     @Published private(set) var bytes = 0
     /// The last file that was copied, skipped or failed, and why. A run that
     /// is sitting in the two-second settle on a large file would otherwise
@@ -39,6 +40,7 @@ import ParancoCore
         var unchanged = 0
         var skipped = 0
         var failed = 0
+        var notHere = 0
         var bytes = 0
         var lastLine = ""
         /// Name and reason for the first failures. The agent prints only a
@@ -63,6 +65,9 @@ import ParancoCore
                 if failures.count < Self.namedFailures {
                     failures.append("\(name): \(reason)")
                 }
+            case .notHere(let name, let reason):
+                notHere += 1
+                lastLine = "not here \(name): \(reason)"
             }
         }
     }
@@ -83,6 +88,7 @@ import ParancoCore
         unchanged = snapshot.unchanged
         skipped = snapshot.skipped
         failed = snapshot.failed
+        notHere = snapshot.notHere
         bytes = snapshot.bytes
         lastLine = snapshot.lastLine
     }
@@ -94,6 +100,7 @@ import ParancoCore
         unchanged = 0
         skipped = 0
         failed = 0
+        notHere = 0
         bytes = 0
         lastLine = ""
     }

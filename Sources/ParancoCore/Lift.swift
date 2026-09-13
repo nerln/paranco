@@ -6,6 +6,11 @@ public enum LiftEvent: Sendable, Equatable {
     case unchanged(String)
     case skipped(String, reason: String)
     case failed(String, reason: String)
+    /// The name is in the folder and the bytes are somewhere else. Not a
+    /// failure of this program and not something a retry fixes, so it gets a
+    /// category of its own rather than swelling the failed count with a
+    /// message about a bad address.
+    case notHere(String, reason: String)
 }
 
 /// The outcome of running one route once.
@@ -15,10 +20,26 @@ public struct LiftReport: Sendable, Equatable {
     public var unchanged: Int = 0
     public var skipped: Int = 0
     public var failed: Int = 0
+    /// Placeholders: listed in the source with their bytes held by a cloud
+    /// service and not on this Mac.
+    public var notHere: Int = 0
     public var bytes: Int = 0
     public var refused: String?
 
     public init(route: UUID) { self.route = route }
+
+    /// One sentence for the person reading the report, when placeholders were
+    /// found. Deliberately about the filesystem and not about any application:
+    /// the flag it rests on is the same for a voice memo, a photo, a document
+    /// in iCloud Drive and anything else a sync service evicts.
+    public var notHereAdvice: String? {
+        guard notHere > 0 else { return nil }
+        return "\(notHere) of the files are placeholders: the name is here and the "
+             + "contents are held by a cloud service, not on this Mac. Nothing in "
+             + "this program can fetch them. Open them in the application they "
+             + "belong to, or turn off the setting that keeps this Mac's copy small, "
+             + "and they will be copied on a later pass."
+    }
 }
 
 /// A refusal carrying the sentence a person needs, rather than an error code.
@@ -73,6 +94,34 @@ public enum Lift {
                 return .failure(Refusal(error.localizedDescription))
             }
         }
+    }
+
+    /// Whether the bytes of a file are on this disk, from the filesystem alone.
+    ///
+    /// Two signs, both independent of which application owns the file. APFS marks
+    /// a file whose contents have been evicted by a sync service with SF_DATALESS,
+    /// and reading such a file asks the service to bring the bytes back; when no
+    /// service answers, the read fails with EFAULT, which strerror renders as
+    /// "Bad address" and which reads as nonsense to a person. The second sign is
+    /// a file that claims a size and has no blocks allocated to it, which is the
+    /// same condition on a filesystem that does not set the flag.
+    ///
+    /// Measured on a library of 176 recordings: 103 of them were this, and the
+    /// program reported every one as a failed write.
+    public static func isPlaceholder(_ url: URL) -> Bool {
+        var st = stat()
+        guard lstat(url.path, &st) == 0, (st.st_mode & S_IFMT) == S_IFREG else { return false }
+        if UInt32(st.st_flags) & UInt32(SF_DATALESS) != 0 { return true }
+        return st.st_size > 0 && st.st_blocks == 0
+    }
+
+    /// Ask the system to bring a placeholder's bytes back, where there is a
+    /// public way to ask. There is one for iCloud Drive; for anything else the
+    /// owning application is the only thing that can, and this returns false.
+    static func requestContents(_ url: URL) -> Bool {
+        let values = try? url.resourceValues(forKeys: [.isUbiquitousItemKey])
+        guard values?.isUbiquitousItem == true else { return false }
+        return (try? FileManager.default.startDownloadingUbiquitousItem(at: url)) != nil
     }
 
     /// Size without following a link: a symlink at the target must never be
@@ -146,6 +195,14 @@ public enum Lift {
                 progress(.unchanged(name))
                 continue
             }
+            if isPlaceholder(source) {
+                report.notHere += 1
+                let asked = requestContents(source)
+                progress(.notHere(name, reason: asked
+                    ? "in iCloud Drive; download requested, will copy once it has arrived"
+                    : "contents held by a cloud service, not on this Mac"))
+                continue
+            }
             if settling > 0 {
                 Thread.sleep(forTimeInterval: settling)
                 if size(source) != theirs {
@@ -155,7 +212,7 @@ public enum Lift {
                 }
             }
             do {
-                try copySafely(from: source, named: name, into: dirfd)
+                try copySafely(from: source, named: name, into: dirfd, expecting: theirs)
                 report.copied += 1
                 report.bytes += theirs
                 progress(.copied(name, bytes: theirs))
@@ -204,11 +261,22 @@ public enum Lift {
 
     enum CopyError: LocalizedError {
         case open(String, Int32)
+        case read(String, Int32)
         case write(String, Int32)
+        case short(String, got: Int, expected: Int)
         var errorDescription: String? {
             switch self {
             case .open(let p, let e): return "cannot open \(p): \(String(cString: strerror(e)))"
+            case .read(let p, let e):
+                // EFAULT on a read is what a placeholder looks like when the flag
+                // was not set. Say that, because "Bad address" says nothing.
+                if e == EFAULT {
+                    return "cannot read \(p): its contents are not on this Mac"
+                }
+                return "cannot read \(p): \(String(cString: strerror(e)))"
             case .write(let p, let e): return "cannot write \(p): \(String(cString: strerror(e)))"
+            case .short(let p, let got, let expected):
+                return "\(p) came out at \(got) bytes of \(expected); not kept"
             }
         }
     }
@@ -216,7 +284,8 @@ public enum Lift {
     /// Bytes into a fresh, private, non-executable file inside an open directory,
     /// then a rename into place. Every name is resolved relative to `dirfd`, so
     /// what the destination path means to the filesystem by now is irrelevant.
-    static func copySafely(from source: URL, named name: String, into dirfd: Int32) throws {
+    static func copySafely(from source: URL, named name: String, into dirfd: Int32,
+                           expecting expected: Int? = nil) throws {
         let input = open(source.path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
         guard input >= 0 else { throw CopyError.open(source.path, errno) }
         defer { close(input) }
@@ -231,18 +300,29 @@ public enum Lift {
         }
 
         var buffer = [UInt8](repeating: 0, count: 1 << 16)
+        var written = 0
         while true {
             let got = read(input, &buffer, buffer.count)
             if got == 0 { break }
-            if got < 0 { throw CopyError.write(scratch, errno) }
+            // A failed read used to be reported as a failed write of the scratch
+            // file, which sent the diagnosis to the wrong side of the copy.
+            if got < 0 { throw CopyError.read(source.lastPathComponent, errno) }
             var offset = 0
             while offset < got {
                 let put = write(output, &buffer[offset], got - offset)
                 if put < 0 { throw CopyError.write(scratch, errno) }
                 offset += put
             }
+            written += got
         }
         fsync(output)
+
+        // A copy that stopped early is not a copy, and renaming it into place
+        // would make it one as far as the next pass could tell: same name, and
+        // from then on the size the destination has is the size it compares.
+        if let expected, written != expected {
+            throw CopyError.short(name, got: written, expected: expected)
+        }
 
         // If something is sitting at the target name it is replaced by the
         // rename, whatever it is. A symlink planted there is replaced as a link

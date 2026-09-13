@@ -314,7 +314,8 @@ struct LiveReport: View {
                     Text("Lifting").font(.headline)
                 }
                 ReportGrid(copied: live.copied, unchanged: live.unchanged,
-                           skipped: live.skipped, failed: live.failed, bytes: live.bytes)
+                           skipped: live.skipped, failed: live.failed,
+                           notHere: live.notHere, bytes: live.bytes)
                 if !live.lastLine.isEmpty {
                     Text(live.lastLine)
                         .font(.system(size: 11, design: .monospaced))
@@ -369,7 +370,16 @@ struct FinishedReport: View {
                 } else {
                     ReportGrid(copied: report.copied, unchanged: report.unchanged,
                                skipped: report.skipped, failed: report.failed,
-                               bytes: report.bytes)
+                               notHere: report.notHere, bytes: report.bytes)
+                    if let advice = report.notHereAdvice {
+                        // Not in the failures list and not in warning colour: it is
+                        // a fact about where the bytes live, and the sentence says
+                        // what a person can do about it.
+                        Text(advice)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
                     if !done.failures.isEmpty {
                         // Named here and nowhere else. The agent logs a count,
                         // and a count is not something anybody can act on.
@@ -395,13 +405,14 @@ struct FinishedReport: View {
     }
 }
 
-/// Four numbers and the bytes, laid out the same way live and finished, so
+/// Five numbers and the bytes, laid out the same way live and finished, so
 /// the eye does not have to find them again when the run ends.
 struct ReportGrid: View {
     let copied: Int
     let unchanged: Int
     let skipped: Int
     let failed: Int
+    var notHere: Int = 0
     let bytes: Int
 
     var body: some View {
@@ -411,6 +422,9 @@ struct ReportGrid: View {
                 figure(unchanged, "already there")
                 figure(skipped, "skipped")
                 figure(failed, "failed", warn: failed > 0)
+                if notHere > 0 {
+                    figure(notHere, "not on this Mac")
+                }
             }
             Text(bytes == 0 ? "Nothing copied" : "\(bytesText(bytes)) copied")
                 .font(.caption)

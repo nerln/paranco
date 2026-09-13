@@ -49,6 +49,7 @@ func lift(_ route: Route) {
         case .unchanged: break
         case .skipped(let name, let reason): print("   skipped \(Agent.sanitised(name)): \(reason)")
         case .failed(let name, let reason): print("   failed \(Agent.sanitised(name)): \(reason)")
+        case .notHere(let name, let reason): print("   not here \(Agent.sanitised(name)): \(reason)")
         }
     }
     if let why = report.refused {
@@ -56,7 +57,8 @@ func lift(_ route: Route) {
         return
     }
     print("   \(report.copied) copied, \(report.unchanged) already there, "
-          + "\(report.skipped) skipped, \(report.failed) failed")
+          + "\(report.skipped) skipped, \(report.failed) failed, \(report.notHere) not on this Mac")
+    if let advice = report.notHereAdvice { print("   \(advice)") }
 }
 
 func option(_ name: String, in args: inout [String]) -> String? {

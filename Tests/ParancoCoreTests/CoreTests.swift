@@ -275,3 +275,123 @@ struct MigrationTests {
         #expect(notes.count == 1)
     }
 }
+
+/// Files whose name is here and whose bytes are not.
+///
+/// A sync service that keeps this Mac's copy small leaves the name in the
+/// folder and takes the contents away. Reading one asks the service to bring
+/// them back; when nothing answers, the read fails with EFAULT, which strerror
+/// spells "Bad address". On a real library of 176 recordings, 103 were this,
+/// and every one was reported as a failed write of the scratch file.
+///
+/// A dataless file cannot be made on demand from a test, so what is pinned here
+/// is everything around the flag: the second sign (a size with no blocks, which
+/// a sparse file reproduces), the category the loop puts it in, the sentence,
+/// and that a read error is now blamed on the side that failed.
+struct PlaceholderTests {
+
+    /// A file that claims a size and holds no data: the shape of an evicted file
+    /// on a filesystem that does not set the flag.
+    static func sparse(_ folder: URL, _ name: String, size: Int) -> URL {
+        let url = folder.appendingPathComponent(name)
+        let fd = open(url.path, O_WRONLY | O_CREAT, 0o600)
+        precondition(fd >= 0)
+        precondition(ftruncate(fd, off_t(size)) == 0)
+        close(fd)
+        return url
+    }
+
+    @Test("an ordinary file is not a placeholder")
+    func ordinary() {
+        let f = Fixtures.folder("plain")
+        defer { try? FileManager.default.removeItem(at: f) }
+        #expect(Lift.isPlaceholder(Fixtures.file(f, "a.m4a", bytes: 4096)) == false)
+    }
+
+    @Test("an empty file is not a placeholder either")
+    func empty() {
+        // Zero bytes and zero blocks is a genuinely empty file, not an evicted one.
+        let f = Fixtures.folder("empty")
+        defer { try? FileManager.default.removeItem(at: f) }
+        #expect(Lift.isPlaceholder(Fixtures.file(f, "a.m4a", bytes: 0)) == false)
+    }
+
+    @Test("a size with no blocks behind it is a placeholder")
+    func sizeWithoutBlocks() {
+        let f = Fixtures.folder("sparse")
+        defer { try? FileManager.default.removeItem(at: f) }
+        let url = Self.sparse(f, "gone.m4a", size: 10_000_000)
+        var st = stat()
+        // APFS may allocate nothing for a hole; if it did allocate, the test
+        // cannot say anything and steps aside rather than asserting on a guess.
+        guard stat(url.path, &st) == 0, st.st_blocks == 0 else { return }
+        #expect(Lift.isPlaceholder(url))
+    }
+
+    @Test("a placeholder is counted apart from failures and does not stop the run")
+    func countedApart() {
+        let src = Fixtures.folder("src"), dst = Fixtures.folder("dst")
+        defer {
+            try? FileManager.default.removeItem(at: src)
+            try? FileManager.default.removeItem(at: dst)
+        }
+        Fixtures.file(src, "real.m4a", bytes: 2048)
+        let ghost = Self.sparse(src, "ghost.m4a", size: 5_000_000)
+        var st = stat()
+        guard stat(ghost.path, &st) == 0, st.st_blocks == 0 else { return }
+
+        var events: [LiftEvent] = []
+        let report = Lift.run(Fixtures.route(from: src, to: dst), settling: 0) { events.append($0) }
+
+        #expect(report.copied == 1)
+        #expect(report.failed == 0)
+        #expect(report.notHere == 1)
+        #expect(events.contains { if case .notHere("ghost.m4a", _) = $0 { return true }; return false })
+        // The real file went through; the ghost was not written at all.
+        #expect(FileManager.default.fileExists(atPath: dst.appendingPathComponent("real.m4a").path))
+        #expect(!FileManager.default.fileExists(atPath: dst.appendingPathComponent("ghost.m4a").path))
+    }
+
+    @Test("the advice names the count and says what to do, without naming an application")
+    func advice() {
+        var report = LiftReport(route: UUID())
+        #expect(report.notHereAdvice == nil)
+        report.notHere = 103
+        let text = report.notHereAdvice ?? ""
+        #expect(text.contains("103"))
+        #expect(text.contains("not on this Mac"))
+        #expect(!text.lowercased().contains("voice memo"))
+    }
+
+    @Test("a copy that comes out short is not kept")
+    func shortCopy() throws {
+        let src = Fixtures.folder("src"), dst = Fixtures.folder("dst")
+        defer {
+            try? FileManager.default.removeItem(at: src)
+            try? FileManager.default.removeItem(at: dst)
+        }
+        let file = Fixtures.file(src, "a.m4a", bytes: 1000)
+        let dirfd = open(dst.path, O_RDONLY | O_DIRECTORY)
+        defer { close(dirfd) }
+        // The caller believed the file was 5000 bytes long. Whatever the reason
+        // for the difference, a copy that does not match is not renamed into
+        // place, because from then on the destination's size is the truth the
+        // next pass compares against.
+        #expect(throws: Lift.CopyError.self) {
+            try Lift.copySafely(from: file, named: "a.m4a", into: dirfd, expecting: 5000)
+        }
+        #expect(!FileManager.default.fileExists(atPath: dst.appendingPathComponent("a.m4a").path))
+        // And no scratch file is left behind.
+        let leftovers = try FileManager.default.contentsOfDirectory(atPath: dst.path)
+        #expect(leftovers.isEmpty)
+    }
+
+    @Test("a read error is blamed on the source, not on the scratch file")
+    func readErrorNaming() {
+        let message = Lift.CopyError.read("thing.m4a", EFAULT).errorDescription ?? ""
+        #expect(message.contains("thing.m4a"))
+        #expect(message.contains("not on this Mac"))
+        #expect(!message.contains("Bad address"))
+        #expect(!message.contains(".part"))
+    }
+}
