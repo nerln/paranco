@@ -25,6 +25,8 @@ public struct LiftReport: Sendable, Equatable {
     public var notHere: Int = 0
     public var bytes: Int = 0
     public var refused: String?
+    /// One line about the process, for the report: the read policy, mainly.
+    public var note: String = ""
 
     public init(route: UUID) { self.route = route }
 
@@ -115,6 +117,52 @@ public enum Lift {
         return st.st_size > 0 && st.st_blocks == 0
     }
 
+    /// What the filesystem says about a file, in one line, for a report.
+    ///
+    /// Size, blocks actually allocated, every flag by name, and whether a sync
+    /// service claims it. This is what to read when a copy fails for a reason
+    /// strerror cannot express: a file with blocks and no flag that still cannot
+    /// be read is a different animal from a placeholder, and the line says which.
+    public static func describe(_ url: URL) -> String {
+        var st = stat()
+        guard lstat(url.path, &st) == 0 else { return "cannot stat: \(String(cString: strerror(errno)))" }
+        let flags = UInt32(st.st_flags)
+        let names: [(UInt32, String)] = [
+            (UInt32(SF_DATALESS), "dataless"), (UInt32(UF_DATAVAULT), "datavault"),
+            (UInt32(UF_COMPRESSED), "compressed"), (UInt32(UF_TRACKED), "tracked"),
+            (UInt32(UF_HIDDEN), "hidden"), (UInt32(SF_RESTRICTED), "restricted"),
+            (UInt32(UF_IMMUTABLE), "uchg"), (UInt32(SF_IMMUTABLE), "schg"),
+        ]
+        var set = names.filter { flags & $0.0 != 0 }.map(\.1)
+        let known = names.reduce(UInt32(0)) { $0 | $1.0 }
+        if flags & ~known != 0 { set.append(String(format: "0x%08x", flags & ~known)) }
+        let values = try? url.resourceValues(forKeys: [.isUbiquitousItemKey,
+                                                       .ubiquitousItemDownloadingStatusKey])
+        var cloud = ""
+        if values?.isUbiquitousItem == true {
+            cloud = ", iCloud item, status \(values?.ubiquitousItemDownloadingStatus?.rawValue ?? "?")"
+        }
+        return "\(st.st_size) bytes, \(st.st_blocks) blocks, flags [\(set.joined(separator: " "))]\(cloud)"
+    }
+
+    /// Ask the kernel to bring dataless files back when they are read.
+    ///
+    /// macOS has a per-process policy for this and its default is not
+    /// documented to be on. A process that reads a dataless file with the policy
+    /// off gets an error instead of a download. Setting it costs nothing where
+    /// nothing is dataless, and where something is, it is the difference between
+    /// copying the file and reporting that it could not be read. Returns what
+    /// the policy was before, for the report.
+    @discardableResult
+    public static func materialiseOnRead() -> String {
+        let before = getiopolicy_np(IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES, IOPOL_SCOPE_PROCESS)
+        let ok = setiopolicy_np(IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES, IOPOL_SCOPE_PROCESS,
+                                IOPOL_MATERIALIZE_DATALESS_FILES_ON) == 0
+        let name = ["default", "off", "on", "?", "orig"]
+        return "materialise-on-read was \(before >= 0 && before < name.count ? name[Int(before)] : "\(before)")"
+             + (ok ? ", now on" : ", could not be set: \(String(cString: strerror(errno)))")
+    }
+
     /// Ask the system to bring a placeholder's bytes back, where there is a
     /// public way to ask. There is one for iCloud Drive; for anything else the
     /// owning application is the only thing that can, and this returns false.
@@ -137,6 +185,7 @@ public enum Lift {
     public static func run(_ route: Route, settling: TimeInterval = 2.0,
                            progress: (LiftEvent) -> Void = { _ in }) -> LiftReport {
         var report = LiftReport(route: route.id)
+        report.note = materialiseOnRead()
 
         let destination: URL
         switch Destination.validate(route.destination) {
@@ -216,9 +265,18 @@ public enum Lift {
                 report.copied += 1
                 report.bytes += theirs
                 progress(.copied(name, bytes: theirs))
+            } catch CopyError.read(_, let code) where code == EFAULT || code == EDEADLK {
+                // The flags said nothing and the read said everything: these two
+                // errors on a regular file with a valid buffer mean the kernel
+                // could not produce the bytes, which is a placeholder by another
+                // name. Counted with them, and described so the next person does
+                // not have to guess what the filesystem saw.
+                report.notHere += 1
+                progress(.notHere(name, reason: "could not be read (\(String(cString: strerror(code))))"
+                                  + "; \(describe(source))"))
             } catch {
                 report.failed += 1
-                progress(.failed(name, reason: error.localizedDescription))
+                progress(.failed(name, reason: "\(error.localizedDescription); \(describe(source))"))
             }
         }
         return report

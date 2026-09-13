@@ -371,6 +371,11 @@ struct FinishedReport: View {
                     ReportGrid(copied: report.copied, unchanged: report.unchanged,
                                skipped: report.skipped, failed: report.failed,
                                notHere: report.notHere, bytes: report.bytes)
+                    if !report.note.isEmpty {
+                        Text(report.note)
+                            .font(.system(size: 11, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                    }
                     if let advice = report.notHereAdvice {
                         // Not in the failures list and not in warning colour: it is
                         // a fact about where the bytes live, and the sentence says

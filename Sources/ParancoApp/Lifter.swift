@@ -68,6 +68,9 @@ import ParancoCore
             case .notHere(let name, let reason):
                 notHere += 1
                 lastLine = "not here \(name): \(reason)"
+                if failures.count < Self.namedFailures {
+                    failures.append("\(name): \(reason)")
+                }
             }
         }
     }

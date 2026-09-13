@@ -58,6 +58,7 @@ func lift(_ route: Route) {
     }
     print("   \(report.copied) copied, \(report.unchanged) already there, "
           + "\(report.skipped) skipped, \(report.failed) failed, \(report.notHere) not on this Mac")
+    if !report.note.isEmpty { print("   \(report.note)") }
     if let advice = report.notHereAdvice { print("   \(advice)") }
 }
 
